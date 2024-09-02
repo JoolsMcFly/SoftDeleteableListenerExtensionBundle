@@ -2,12 +2,13 @@
 
 namespace Evence\Bundle\SoftDeleteableExtensionBundle\EventListener;
 
+use DateTime;
 use Doctrine\Common\Annotations\AnnotationReader;
 use Doctrine\Common\Annotations\Reader;
 use Doctrine\Common\Proxy\Proxy;
 use Doctrine\Common\Util\ClassUtils;
 use Doctrine\ORM\EntityManager;
-use Doctrine\ORM\Event\LifecycleEventArgs;
+use Doctrine\ORM\EntityManagerInterface;
 use Doctrine\ORM\Mapping\Annotation;
 use Doctrine\ORM\Mapping\ClassMetadata;
 use Doctrine\ORM\Mapping\ManyToMany;
@@ -18,8 +19,14 @@ use Doctrine\ORM\Mapping\ClassMetadataInfo;
 use Evence\Bundle\SoftDeleteableExtensionBundle\Exception\OnSoftDeleteUnknownTypeException;
 use Evence\Bundle\SoftDeleteableExtensionBundle\Mapping\Annotation\onSoftDelete;
 use Evence\Bundle\SoftDeleteableExtensionBundle\Mapping\Annotation\onSoftDeleteSuccessor;
+use Exception;
+use Gedmo\Mapping\Annotation\SoftDeleteable;
 use Gedmo\Mapping\ExtensionMetadataFactory;
+use Gedmo\SoftDeleteable\Event\PreSoftDeleteEventArgs;
 use Gedmo\SoftDeleteable\SoftDeleteableListener as GedmoSoftDeleteableListener;
+use ReflectionClass;
+use ReflectionObject;
+use ReflectionProperty;
 use Symfony\Component\DependencyInjection\ContainerAwareTrait;
 use Symfony\Component\PropertyAccess\PropertyAccess;
 
@@ -40,23 +47,25 @@ class SoftDeleteListener
      */
     protected $reader;
 
-    public function __construct(Reader $reader)
+    protected $entityManager;
+
+    public function __construct(Reader $reader, EntityManagerInterface $entityManager)
     {
         $this->reader = $reader;
+        $this->entityManager = $entityManager;
     }
 
     /**
-     * @param LifecycleEventArgs $args
      *
      * @throws OnSoftDeleteUnknownTypeException
-     * @throws \Exception
+     * @throws Exception
      */
-    public function preSoftDelete(LifecycleEventArgs $args)
+    public function preSoftDelete(PreSoftDeleteEventArgs $args): void
     {
-        $em = $args->getEntityManager();
-        $entity = $args->getEntity();
+        $em = $this->entityManager;
+        $entity = $args->getObject();
 
-        $entityReflection = new \ReflectionObject($entity);
+        $entityReflection = new ReflectionObject($entity);
 
         $namespaces = $em->getConfiguration()
             ->getMetadataDriverImpl()
@@ -64,7 +73,7 @@ class SoftDeleteListener
 
         $reader = new AnnotationReader();
         foreach ($namespaces as $namespace) {
-            $reflectionClass = new \ReflectionClass($namespace);
+            $reflectionClass = new ReflectionClass($namespace);
             if ($reflectionClass->isAbstract()) {
                 continue;
             }
@@ -104,7 +113,7 @@ class SoftDeleteListener
                         }
 
                         if (!$this->isOnDeleteTypeSupported($onDelete, $relationship)) {
-                            throw new \Exception(sprintf('%s is not supported for %s relationships', $onDelete->type, get_class($relationship)));
+                            throw new Exception(sprintf('%s is not supported for %s relationships', $onDelete->type, get_class($relationship)));
                         }
 
                         if (($manyToOne || $oneToOne) && $ns && $entity instanceof $ns) {
@@ -130,8 +139,8 @@ class SoftDeleteListener
                                         $propertyAccessor = PropertyAccess::createPropertyAccessor();
                                         $collection = $propertyAccessor->getValue($mtmRelation, $property->name);
                                         $collection->removeElement($entity);
-                                    } catch (\Exception $e) {
-                                        throw new \Exception(sprintf('No accessor found for %s in %s', $property->name, get_class($mtmRelation)));
+                                    } catch (Exception $e) {
+                                        throw new Exception(sprintf('No accessor found for %s in %s', $property->name, get_class($mtmRelation)));
                                     }
                                 }
                             } elseif ($allowMappedSide) {
@@ -140,19 +149,20 @@ class SoftDeleteListener
                                     $collection = $propertyAccessor->getValue($entity, $property->name);
                                     $collection->clear();
                                     continue;
-                                } catch (\Exception $e) {
-                                    throw new \Exception(sprintf('No accessor found for %s in %s', $property->name, get_class($entity)));
+                                } catch (Exception $e) {
+                                    throw new Exception(sprintf('No accessor found for %s in %s', $property->name, get_class($entity)));
                                 }
                             }
                         }
                     }
 
                     if ($objects) {
-                        $reflectionClass = new \ReflectionClass($namespace);
-                        $classAnnotation = $this->reader->getClassAnnotation($reflectionClass, \Gedmo\Mapping\Annotation\SoftDeleteable::class);
-                        $softDelete = $classAnnotation instanceof \Gedmo\Mapping\Annotation\SoftDeleteable;
+                        $reflectionClass = new ReflectionClass($namespace);
+                        $classAnnotation = $this->reader->getClassAnnotation($reflectionClass, SoftDeleteable::class);
+                        $softDelete = $classAnnotation instanceof SoftDeleteable;
                         foreach ($objects as $object) {
-                            $this->processOnDeleteOperation($object, $onDelete, $property, $meta, $softDelete, $args, ['fieldName' => $classAnnotation->fieldName]);
+                            $this->processOnDeleteOperation($object, $onDelete, $property, $meta, $softDelete,
+                                ['fieldName' => $classAnnotation->fieldName]);
                         }
                     }
                 }
@@ -161,89 +171,58 @@ class SoftDeleteListener
     }
 
     /**
-     * @param $object
-     * @param onSoftDelete $onDelete
-     * @param \ReflectionProperty $property
-     * @param ClassMetadata $meta
-     * @param $softDelete
-     * @param LifecycleEventArgs $args
-     * @param $config
      * @throws OnSoftDeleteUnknownTypeException
+     * @throws Exception
      */
     protected function processOnDeleteOperation(
         $object,
         onSoftDelete $onDelete,
-        \ReflectionProperty $property,
+        ReflectionProperty $property,
         ClassMetadata $meta,
         $softDelete,
-        LifecycleEventArgs $args,
         $config
-    ) {
+    ): void {
         if (strtoupper($onDelete->type) === 'SET NULL') {
-            $this->processOnDeleteSetNullOperation($object, $onDelete, $property, $meta, $softDelete, $args, $config);
+            $this->processOnDeleteSetNullOperation($object, $property, $meta);
         } elseif (strtoupper($onDelete->type) === 'CASCADE') {
-            $this->processOnDeleteCascadeOperation($object, $onDelete, $property, $meta, $softDelete, $args, $config);
+            $this->processOnDeleteCascadeOperation($object, $softDelete, $config);
         } elseif (strtoupper($onDelete->type) === 'SUCCESSOR') {
-            $this->processOnDeleteSuccessorOperation($object, $onDelete, $property, $meta, $softDelete, $args, $config);
+            $this->processOnDeleteSuccessorOperation($object, $property, $meta);
         } else {
             throw new OnSoftDeleteUnknownTypeException($onDelete->type);
         }
     }
 
-    /**
-     * @param $object
-     * @param onSoftDelete $onDelete
-     * @param \ReflectionProperty $property
-     * @param ClassMetadata $meta
-     * @param $softDelete
-     * @param LifecycleEventArgs $args
-     * @param $config
-     */
     protected function processOnDeleteSetNullOperation(
         $object,
-        onSoftDelete $onDelete,
-        \ReflectionProperty $property,
-        ClassMetadata $meta,
-        $softDelete,
-        LifecycleEventArgs $args,
-        $config
-    ) {
+        ReflectionProperty $property,
+        ClassMetadata $meta
+    ): void {
         $reflProp = $meta->getReflectionProperty($property->name);
         $oldValue = $reflProp->getValue($object);
 
         $reflProp->setValue($object, null);
-        $args->getEntityManager()->persist($object);
+        $this->entityManager->persist($object);
 
-        $args->getEntityManager()->getUnitOfWork()->propertyChanged($object, $property->name, $oldValue, null);
-        $args->getEntityManager()->getUnitOfWork()->scheduleExtraUpdate($object, array(
+        $this->entityManager->getUnitOfWork()->propertyChanged($object, $property->name, $oldValue, null);
+        $this->entityManager->getUnitOfWork()->scheduleExtraUpdate($object, array(
             $property->name => array($oldValue, null),
         ));
     }
 
     /**
-     * @param $object
-     * @param onSoftDelete $onDelete
-     * @param \ReflectionProperty $property
-     * @param ClassMetadata $meta
-     * @param $softDelete
-     * @param LifecycleEventArgs $args
-     * @param $config
-     * @throws \Exception
+     * @throws Exception
      */
     protected function processOnDeleteSuccessorOperation(
         $object,
-        onSoftDelete $onDelete,
-        \ReflectionProperty $property,
-        ClassMetadata $meta,
-        $softDelete,
-        LifecycleEventArgs $args,
-        $config
-    ) {
+        ReflectionProperty $property,
+        ClassMetadata $meta
+    ): void {
         $reflProp = $meta->getReflectionProperty($property->name);
         $oldValue = $reflProp->getValue($object);
 
         $reader = new AnnotationReader();
-        $reflectionClass = new \ReflectionClass(ClassUtils::getClass($oldValue));
+        $reflectionClass = new ReflectionClass(ClassUtils::getClass($oldValue));
         $successors = [];
         foreach ($reflectionClass->getProperties() as $propertyOfOldValueObject) {
             if ($reader->getPropertyAnnotation($propertyOfOldValueObject, onSoftDeleteSuccessor::class)) {
@@ -252,9 +231,9 @@ class SoftDeleteListener
         }
 
         if (count($successors) > 1) {
-            throw new \Exception('Only one property of deleted entity can be marked as successor.');
+            throw new Exception('Only one property of deleted entity can be marked as successor.');
         } elseif (empty($successors)) {
-            throw new \Exception('One property of deleted entity must be marked as successor.');
+            throw new Exception('One property of deleted entity must be marked as successor.');
         }
 
         $successors[0]->setAccessible(true);
@@ -265,80 +244,57 @@ class SoftDeleteListener
 
         $newValue = $successors[0]->getValue($oldValue);
         $reflProp->setValue($object, $newValue);
-        $args->getEntityManager()->persist($object);
+        $this->entityManager->persist($object);
 
-        $args->getEntityManager()->getUnitOfWork()->propertyChanged($object, $property->name, $oldValue, $newValue);
-        $args->getEntityManager()->getUnitOfWork()->scheduleExtraUpdate($object, array(
+        $this->entityManager->getUnitOfWork()->propertyChanged($object, $property->name, $oldValue, $newValue);
+        $this->entityManager->getUnitOfWork()->scheduleExtraUpdate($object, array(
             $property->name => array($oldValue, $newValue),
         ));
     }
 
-    /**
-     * @param $object
-     * @param onSoftDelete $onDelete
-     * @param \ReflectionProperty $property
-     * @param ClassMetadata $meta
-     * @param $softDelete
-     * @param LifecycleEventArgs $args
-     * @param $config
-     */
     protected function processOnDeleteCascadeOperation(
         $object,
-        onSoftDelete $onDelete,
-        \ReflectionProperty $property,
-        ClassMetadata $meta,
         $softDelete,
-        LifecycleEventArgs $args,
         $config
-    ) {
+    ): void {
         if ($softDelete) {
-            $this->softDeleteCascade($args->getEntityManager(), $config, $object);
+            $this->softDeleteCascade($config, $object);
         } else {
-            $args->getEntityManager()->remove($object);
+            $this->entityManager->remove($object);
         }
     }
 
-    /**
-     * @param EntityManager $em
-     * @param $config
-     * @param $object
-     */
-    protected function softDeleteCascade($em, $config, $object)
+    protected function softDeleteCascade($config, $object): void
     {
-        $meta = $em->getClassMetadata(get_class($object));
+        $meta = $this->entityManager->getClassMetadata(get_class($object));
         $reflProp = $meta->getReflectionProperty($config['fieldName']);
         $oldValue = $reflProp->getValue($object);
-        if ($oldValue instanceof \Datetime) {
+        if ($oldValue instanceof Datetime) {
             return;
         }
 
         //trigger event to check next level
-        $em->getEventManager()->dispatchEvent(
+        $this->entityManager->getEventManager()->dispatchEvent(
             GedmoSoftDeleteableListener::PRE_SOFT_DELETE,
-            new LifecycleEventArgs($object, $em)
+            new PreSoftDeleteEventArgs($object, $this->entityManager)
         );
 
-        $date = new \DateTime();
+        $date = new DateTime();
         $reflProp->setValue($object, $date);
 
-        $uow = $em->getUnitOfWork();
+        $uow = $this->entityManager->getUnitOfWork();
         $uow->propertyChanged($object, $config['fieldName'], $oldValue, $date);
         $uow->scheduleExtraUpdate($object, array(
             $config['fieldName'] => array($oldValue, $date),
         ));
 
-        $em->getEventManager()->dispatchEvent(
+        $this->entityManager->getEventManager()->dispatchEvent(
             GedmoSoftDeleteableListener::POST_SOFT_DELETE,
-            new LifecycleEventArgs($object, $em)
+            new PreSoftDeleteEventArgs($object, $this->entityManager)
         );
     }
 
-    /**
-     * @param onSoftDelete $onDelete
-     * @param Annotation $relationship
-     * @return bool
-     */
-    protected function isOnDeleteTypeSupported(onSoftDelete $onDelete, $relationship)
+    protected function isOnDeleteTypeSupported(onSoftDelete $onDelete, $relationship): bool
     {
         if (strtoupper($onDelete->type) === 'SET NULL' && ($relationship instanceof ManyToMany || (property_exists($relationship, 'type') && $relationship->type === ClassMetadataInfo::MANY_TO_MANY))) {
             return false;
